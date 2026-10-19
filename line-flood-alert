@@ -1,0 +1,187 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// ================= WIFI =================
+const char* ssid = "PANOA_FT8";
+const char* password = "@panoa123";
+
+// ================= LINE BOT =================
+const char* LINE_CHANNEL_ACCESS_TOKEN =
+  "3uAnK/FwZjyPy792I7ZKnRmANX6yd4Qj7p+g1y66U22GQSp9mNS+1pq7bcgGG9ApwKW5tI7Ky+G/PIVdvpCgJ5S8OsQM1vUYQ8cnWU84wg6sAXvOEU0fkoY2n8kioRW+I97/yIhHEwGN/BWIqF9q7wdB04t89/1O/w1cDnyilFU=";
+
+// LINE User ID ของผู้รับข้อความส่วนตัว
+const char* LINE_USER_ID = "U0d1bec4a3db9e71690a8133dd67ebafb";
+
+// LINE Group ID ของกลุ่ม
+// ใส่ ID จริงหลังจากตั้งค่าระบบกลุ่มเสร็จแล้ว
+const char* LINE_GROUP_ID = "";
+
+// ================= PIN =================
+const int sensorPin = 23;
+const int buzzerPin = 15;
+const int blueLedPin = 21;
+const int redLedPin = 17;
+
+// ================= STATUS =================
+bool floodState = false;
+bool lastFloodState = false;
+
+unsigned long lastBuzzerTime = 0;
+bool buzzerState = false;
+
+unsigned long lastSensorChange = 0;
+const unsigned long debounceTime = 1000;
+
+// ================= SEND LINE =================
+void sendLineTo(const char* recipientId, String message) {
+  if (recipientId == nullptr || strlen(recipientId) == 0) {
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected. Cannot send LINE.");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();  // ใช้สำหรับทดสอบเท่านั้น
+
+  HTTPClient https;
+
+  if (!https.begin(client,
+      "https://api.line.me/v2/bot/message/push")) {
+    Serial.println("Cannot connect to LINE API");
+    return;
+  }
+
+  https.addHeader("Content-Type", "application/json");
+  https.addHeader(
+    "Authorization",
+    String("Bearer ") + LINE_CHANNEL_ACCESS_TOKEN
+  );
+
+  JsonDocument doc;
+  doc["to"] = recipientId;
+
+  JsonObject msg = doc["messages"].add<JsonObject>();
+  msg["type"] = "text";
+  msg["text"] = message;
+
+  String requestBody;
+  serializeJson(doc, requestBody);
+
+  int httpCode = https.POST(requestBody);
+
+  Serial.print("LINE HTTP Code: ");
+  Serial.println(httpCode);
+
+  if (httpCode > 0) {
+    Serial.println(https.getString());
+  } else {
+    Serial.println(https.errorToString(httpCode));
+  }
+
+  https.end();
+}
+
+// ================= SEND TO EVERYONE =================
+void sendFloodAlert(String message) {
+  // ส่งเข้า LINE ส่วนตัว
+  sendLineTo(LINE_USER_ID, message);
+
+  // ส่งเข้ากลุ่ม ถ้ามี Group ID แล้ว
+  if (strlen(LINE_GROUP_ID) > 0) {
+    sendLineTo(LINE_GROUP_ID, message);
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(sensorPin, INPUT_PULLUP);
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(blueLedPin, OUTPUT);
+  pinMode(redLedPin, OUTPUT);
+
+  digitalWrite(buzzerPin, LOW);
+  digitalWrite(blueLedPin, HIGH);
+  digitalWrite(redLedPin, LOW);
+
+  Serial.println();
+  Serial.println("Flood Alert System Starting...");
+
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi Connected!");
+  Serial.println(WiFi.localIP());
+
+  sendFloodAlert("ระบบแจ้งเตือนน้ำท่วมเริ่มทำงานแล้ว");
+}
+
+// ================= LOOP =================
+void loop() {
+  int sensorValue = digitalRead(sensorPin);
+
+  // สมมติ HIGH = ตรวจพบน้ำ และ LOW = ไม่พบน้ำ
+  bool detectedFlood = (sensorValue == HIGH);
+
+  // ป้องกันการเปลี่ยนสถานะจากสัญญาณรบกวน
+  if (detectedFlood != floodState) {
+    if (millis() - lastSensorChange >= debounceTime) {
+      lastFloodState = floodState;
+      floodState = detectedFlood;
+      lastSensorChange = millis();
+
+      if (floodState) {
+        Serial.println("FLOOD DETECTED!");
+
+        digitalWrite(redLedPin, HIGH);
+        digitalWrite(blueLedPin, LOW);
+
+        sendFloodAlert(
+          "🚨 แจ้งเตือนน้ำท่วม!\n"
+          "ตรวจพบระดับน้ำ กรุณาตรวจสอบพื้นที่ทันที"
+        );
+      } else {
+        Serial.println("WATER LEVEL NORMAL");
+
+        digitalWrite(redLedPin, LOW);
+        digitalWrite(blueLedPin, HIGH);
+
+        digitalWrite(buzzerPin, LOW);
+        buzzerState = false;
+
+        sendFloodAlert(
+          "✅ สถานการณ์กลับสู่ปกติ\n"
+          "เซนเซอร์ไม่ตรวจพบระดับน้ำที่กำหนดแล้ว"
+        );
+      }
+    }
+  } else {
+    lastSensorChange = millis();
+  }
+
+  // ให้ Buzzer ดังเป็นจังหวะเมื่อพบระดับน้ำ
+  if (floodState) {
+    if (millis() - lastBuzzerTime >= 100) {
+      lastBuzzerTime = millis();
+      buzzerState = !buzzerState;
+      digitalWrite(buzzerPin, buzzerState ? HIGH : LOW);
+    }
+  } else {
+    digitalWrite(buzzerPin, LOW);
+  }
+
+  delay(20);
+}
